@@ -104,11 +104,11 @@ func uint32toip4(addr uint32) net.IP {
 
 // proxy handles the handles proxying a connection through a 'fake' IP address
 // given out by our DNS server. Optionally, it tunnels it via a remote host.
-func proxy(conn net.Conn) {
-	defer conn.Close()
-	host, port, err := net.SplitHostPort(conn.LocalAddr().String())
+func proxy(clientc net.Conn) {
+	defer clientc.Close()
+	host, port, err := net.SplitHostPort(clientc.LocalAddr().String())
 	if err != nil {
-		log.Printf("Couldn't parse local address $v: %v", conn.LocalAddr(), err)
+		log.Printf("Couldn't parse local address $v: %v", clientc.LocalAddr(), err)
 		return
 	}
 	localaddr := net.ParseIP(host)
@@ -125,7 +125,7 @@ func proxy(conn net.Conn) {
 		return
 	}
 
-	var destc net.Conn
+	var serverc net.Conn
 	if tunneladdr != "" {
 		// We're tunneling through a remote host, send a header first.
 		hdr, err := json.Marshal(header{Destaddr: destaddr.(string) + ":" + port})
@@ -133,34 +133,39 @@ func proxy(conn net.Conn) {
 			log.Printf("Couldn't marshal header for tunnel: %v", err)
 			return
 		}
-		destc, err = net.Dial("tcp", tunneladdr)
+		serverc, err = net.Dial("tcp", tunneladdr)
 		if err != nil {
 			log.Printf("Couldn't dial our tunnel remote: %v", err)
 			return
 		}
-		log.Printf("Proxying %v to %v via %v", conn.RemoteAddr(), destaddr.(string)+":"+port, tunneladdr)
-		_, err = destc.Write(hdr)
+		log.Printf("Proxying %v to %v via %v", clientc.RemoteAddr(), destaddr.(string)+":"+port, tunneladdr)
+		_, err = serverc.Write(hdr)
 		if err != nil {
 			log.Printf("Couldn't write header to tunnel remote: %v", err)
+			serverc.Close()
 			return
 		}
 	} else {
 		// No tunnel configured, just proxy connections directly.
-		destc, err = net.Dial("tcp", destaddr.(string)+":"+port)
+		serverc, err = net.Dial("tcp", destaddr.(string)+":"+port)
 		if err != nil {
 			log.Printf("Couldn't dial destination $v: %v", destaddr.(string), err)
 			return
 		}
-		log.Printf("Proxying %v to %v", conn.RemoteAddr(), destc.RemoteAddr())
+		log.Printf("Proxying %v to %v", clientc.RemoteAddr(), serverc.RemoteAddr())
 	}
-	defer destc.Close()
+	defer serverc.Close()
 
 	done := make(chan struct{})
 	go func() {
-		io.Copy(destc, conn)
+		io.Copy(serverc, clientc)
 		done <- struct{}{}
 	}()
-	io.Copy(conn, destc)
+	go func() {
+		io.Copy(clientc, serverc)
+		done <- struct{}{}
+	}()
+	// Return & close both connections when one of them EOFs. Is this sound?
 	<-done
 }
 
