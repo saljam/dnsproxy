@@ -266,12 +266,12 @@ func listenAndTunnel(addr string) error {
 	}
 }
 
-func parseAndAddIPRange(r string) error {
+func parseIPRange(r string) error {
 	// TODO Finish this stub.
 	return nil
 }
 
-func parseAndAddCIDR(r string) error {
+func parseCIDR(r string, ipchan chan uint32) error {
 	_, n, err := net.ParseCIDR(r)
 	if err != nil {
 		return err
@@ -280,19 +280,17 @@ func parseAndAddCIDR(r string) error {
 	ones, bits := n.Mask.Size()
 	size := uint32(1) << uint(bits-ones)
 	for i := uint32(0); i < size; i++ {
-		addrpool.pool.Add(addr+i, "--invalid--")
-		log.Printf("Adding %v", uint32toip4(addr+i))
+		ipchan <- addr + i
 	}
 	return nil
 }
 
-func parseAndAddIP(r string) error {
+func parseIP(r string, ipchan chan uint32) error {
 	addr := net.ParseIP(r)
 	if addr == nil {
 		return fmt.Errorf("invalid IP address")
 	}
-	addrpool.pool.Add(ip4touint32(addr), "--invalid--")
-	log.Printf("Adding %v", addr)
+	ipchan <- ip4touint32(addr)
 	return nil
 }
 
@@ -325,26 +323,36 @@ func main() {
 		log.Fatal(listenAndTunnel(tunneladdr))
 	}
 
-	for _, r := range ipranges {
-		if err := parseAndAddCIDR(r); err == nil {
-			continue
-		}
-		if err := parseAndAddIP(r); err == nil {
-			continue
-		}
-		// TODO nmap-style octet addressing ip-range parsing.
-		log.Fatalf("Couldn't parse address range %v", r)
-	}
-
 	addrpool.pool.OnEvicted = func(key lru.Key, value interface{}) {
 		log.Printf("Evicting %s -> %v", uint32toip4(key.(uint32)), value.(string))
 		addrpool.freeaddr = uint32toip4(key.(uint32))
 		delete(addrpool.domains, value.(string))
 	}
 
-	for _, p := range listenports {
-		go listenAndProxy(":" + p)
+	// We pass IPs onto this channel as we parse them.
+	ipchan := make(chan uint32)
+	go func() {
+		for ip := range ipchan {
+			log.Printf("Adding %v", uint32toip4(ip))
+			addrpool.pool.Add(ip, "--invalid--")
+			for _, port := range listenports {
+				go listenAndProxy(uint32toip4(ip).String() + ":" + port)
+			}
+		}
+	}()
+
+	for _, r := range ipranges {
+		if err := parseCIDR(r, ipchan); err == nil {
+			continue
+		}
+		if err := parseIP(r, ipchan); err == nil {
+			continue
+		}
+		// TODO nmap-style octet addressing ip-range parsing.
+		log.Fatalf("Couldn't parse address range %v", r)
 	}
+
+	close(ipchan)
 
 	server := &dns.Server{
 		Addr:    *dnsaddr,
